@@ -56,12 +56,12 @@ jobs:
         run: |
           NDK_CXX="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
           
-          # Collect all C and C++ source files
-          SOURCES=$(find . -type f \( -name "*.cpp" -o -name "*.c" \) ! -path "*/devre_pgo/*")
+          # Include all .cpp files and ONLY tbprobe.c (excluding internal fathom files like tbchess.c)
+          SOURCES=$(find . -type f \( -name "*.cpp" -o -name "tbprobe.c" \) ! -path "*/devre_pgo/*")
 
           echo "Compiling with Android NDK Clang++..."
           $NDK_CXX -O3 -flto -std=c++17 -pthread \
-            -I. -D TB_NO_HELPER_API -DNET=\"devre_mc.bin\" \
+            -I. -Isrc -D TB_NO_HELPER_API -DNET=\"devre_mc.bin\" \
             $SOURCES -lm -o Devre-android-arm64
 
           mkdir -p dist/bin
