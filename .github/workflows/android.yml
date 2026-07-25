@@ -25,7 +25,7 @@ jobs:
         run: |
           curl -sL https://raw.githubusercontent.com/DLTcollab/sse2neon/master/sse2neon.h -o sse2neon.h
 
-      - name: Patch SIMD Headers for ARM64 Translation
+      - name: Patch SIMD Headers and aligned_alloc
         run: |
           python3 -c '
           import os
@@ -34,11 +34,23 @@ jobs:
               with open(path, "r", encoding="utf-8", errors="ignore") as f:
                   content = f.read()
 
+              original = content
+
+              # Replace immintrin header with sse2neon
               if "<immintrin.h>" in content:
-                  new_content = content.replace("<immintrin.h>", "\"sse2neon.h\"")
+                  content = content.replace("<immintrin.h>", "\"sse2neon.h\"")
+
+              # Fallback for std::aligned_alloc on Android NDK
+              if "std::aligned_alloc" in content:
+                  content = content.replace(
+                      "ptr = std::aligned_alloc(Alignment, std::max(alignedBytes, Alignment));",
+                      "posix_memalign(&ptr, Alignment, std::max(alignedBytes, Alignment));"
+                  )
+
+              if content != original:
                   with open(path, "w", encoding="utf-8") as f:
-                      f.write(new_content)
-                  print(f"Patched immintrin in: {path}")
+                      f.write(content)
+                  print(f"Patched: {path}")
 
           for root, dirs, files in os.walk("."):
               for file in files:
@@ -52,14 +64,14 @@ jobs:
             curl -sL "https://github.com/OmerFarukTutkun/DevreNets/raw/main/devre_mc.bin" -o devre_mc.bin
           fi
 
-      - name: Build Devre for Android ARM64
+      - name: Build Devre for Android ARM64 (API 28+)
         run: |
-          NDK_CXX="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
+          NDK_CXX="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++"
           
-          # Include all .cpp files and ONLY tbprobe.c (excluding internal fathom files like tbchess.c)
+          # Include all .cpp files and ONLY tbprobe.c
           SOURCES=$(find . -type f \( -name "*.cpp" -o -name "tbprobe.c" \) ! -path "*/devre_pgo/*")
 
-          echo "Compiling with Android NDK Clang++..."
+          echo "Compiling with Android NDK Clang++ (API 28)..."
           $NDK_CXX -O3 -flto -std=c++17 -pthread \
             -I. -Isrc -D TB_NO_HELPER_API -DNET=\"devre_mc.bin\" \
             $SOURCES -lm -o Devre-android-arm64
