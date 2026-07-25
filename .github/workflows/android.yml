@@ -64,15 +64,16 @@ jobs:
             curl -sL "https://github.com/OmerFarukTutkun/DevreNets/raw/main/devre_mc.bin" -o devre_mc.bin
           fi
 
-      - name: Build Devre for Android ARM64 (API 28+)
+      - name: Build Devre for Android ARM64 (Statically Linked)
         run: |
           NDK_CXX="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++"
           
           # Include all .cpp files and ONLY tbprobe.c
           SOURCES=$(find . -type f \( -name "*.cpp" -o -name "tbprobe.c" \) ! -path "*/devre_pgo/*")
 
-          echo "Compiling with Android NDK Clang++ (API 28)..."
+          echo "Compiling with Android NDK Clang++ (Statically linked C++ runtime)..."
           $NDK_CXX -O3 -flto -std=c++17 -pthread \
+            -static-libstdc++ \
             -I. -Isrc -D TB_NO_HELPER_API -DNET=\"devre_mc.bin\" \
             $SOURCES -lm -o Devre-android-arm64
 
