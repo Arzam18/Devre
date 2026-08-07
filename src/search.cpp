@@ -3,6 +3,7 @@
 #include "tt.h"
 #include "move.h"
 #include "movegen.h"
+#include "movepick.h"
 #include "history.h"
 #include "util.h"
 #include <sstream>
@@ -89,7 +90,7 @@ uint32_t probeTB(Board& pos) {
 }
 
 
-Stack::Stack() : played(0), doubleExtension(0), move(NO_MOVE), staticEval(VALUE_INFINITE), threat(0ull), excludedMove(NO_MOVE) {
+Stack::Stack() : played(0), doubleExtension(0), move(NO_MOVE), staticEval(SCORE_NONE), threat(0ull), excludedMove(NO_MOVE) {
     killers[0]      = NO_MOVE;
     killers[1]      = NO_MOVE;
     pv[0]           = NO_MOVE;
@@ -161,11 +162,7 @@ int Search::qsearch(int alpha, int beta, ThreadData& thread, Stack* ss) {
 
     bool inCheck = board->inCheck();
 
-    auto rawEval = (ttStaticEval != SCORE_NONE) ? ttStaticEval : board->eval();
-
-    if (!ttHit)
-        TT::Instance()->ttSave(board->key, ss->ply, SCORE_NONE, rawEval, TT_NONE, 0, NO_MOVE);
-
+    int      rawEval = SCORE_NONE;
     int      bestScore, score;
     uint16_t move, bestMove = NO_MOVE;
 
@@ -176,6 +173,11 @@ int Search::qsearch(int alpha, int beta, ThreadData& thread, Stack* ss) {
     }
     else
     {
+        rawEval = (ttStaticEval != SCORE_NONE) ? ttStaticEval : board->eval();
+
+        if (!ttHit)
+            TT::Instance()->ttSave(board->key, ss->ply, SCORE_NONE, rawEval, TT_NONE, 0, NO_MOVE);
+
         auto standPat = adjustEvalWithCorrHist(thread, ss, rawEval);
 
         //ttValue can be used as a better position evaluation
@@ -195,18 +197,12 @@ int Search::qsearch(int alpha, int beta, ThreadData& thread, Stack* ss) {
         bestScore = standPat;
     }
 
-    auto moveList = MoveList(ttMove, true);
-    if (inCheck)
-        legalmoves<ALL_MOVES>(*board, moveList);
-    else
-        legalmoves<TACTICAL_MOVES>(*board, moveList);
+    MovePicker picker(thread, ss, ttMove, inCheck ? PICK_QSEARCH_CHECK : PICK_QSEARCH);
+    int        movesSeen = 0;
 
-    // checkmate
-    if (inCheck && moveList.numMove == 0)
-        return -(MAX_MATE_SCORE - ss->ply);
-
-    while ((move = moveList.pickMove(thread, ss)))
+    while ((move = picker.next()))
     {
+        movesSeen++;
 
         if (!inCheck && move != ttMove && !SEE(*board, move))
             continue;
@@ -234,6 +230,10 @@ int Search::qsearch(int alpha, int beta, ThreadData& thread, Stack* ss) {
         }
     }
 
+    // checkmate
+    if (inCheck && movesSeen == 0)
+        return -(MAX_MATE_SCORE - ss->ply);
+
     TT_BOUND bound = bestScore >= beta ? TT_LOWERBOUND : TT_UPPERBOUND;
     TT::Instance()->ttSave(board->key, ss->ply, bestScore, rawEval, bound, 0, bestMove);
     return bestScore;
@@ -254,7 +254,9 @@ int Search::alphaBeta(int alpha, int beta, int depth, const bool cutNode, Thread
     {
         return 0;
     }
-    if (thread.ThreadID == 0 && timeManager->shouldCheck() && timeManager->checkLimits(totalNodes()))
+    // The first iteration is never aborted: it is what produces the move we are
+    // going to send, and it costs a fraction of a millisecond.
+    if (thread.ThreadID == 0 && thread.searchDepth > 1 && timeManager->shouldCheck() && timeManager->checkLimits(totalNodes()))
     {
         stopped = true;
         return 0;
@@ -368,26 +370,49 @@ int Search::alphaBeta(int alpha, int beta, int depth, const bool cutNode, Thread
         }
     }
 
-    int rawEval = (ttStaticEval != SCORE_NONE) ? ttStaticEval : board->eval();
-    int eval = ss->staticEval = adjustEvalWithCorrHist(thread, ss, rawEval);
+    int rawEval = SCORE_NONE;
+    int eval    = SCORE_NONE;
 
-    if (!ttHit)
-        TT::Instance()->ttSave(board->key, ss->ply, SCORE_NONE, rawEval, TT_NONE, 0, NO_MOVE);
+    if (inCheck)
+    {
+        ss->staticEval = SCORE_NONE;
+    }
+    else
+    {
+        rawEval = (ttStaticEval != SCORE_NONE) ? ttStaticEval : board->eval();
+        eval = ss->staticEval = adjustEvalWithCorrHist(thread, ss, rawEval);
 
-    bool improving = !inCheck && ss->staticEval > (ss - 2)->staticEval;
+        if (!ttHit)
+            TT::Instance()->ttSave(board->key, ss->ply, SCORE_NONE, rawEval, TT_NONE, 0, NO_MOVE);
+    }
+
+    bool improving = false;
+    if (!inCheck)
+    {
+        if ((ss - 2)->staticEval != SCORE_NONE)
+            improving = ss->staticEval > (ss - 2)->staticEval;
+        else if ((ss - 4)->staticEval != SCORE_NONE)
+            improving = ss->staticEval > (ss - 4)->staticEval;
+    }
 
     //ttValue can be used as a better position evaluation
     if (ttHit && (ttBound & (ttScore > eval ? TT_LOWERBOUND : TT_UPPERBOUND)))
         eval = ttScore;
 
     //IIR
-    if (!ttHit && depth >= 3 && !PVNode)
+    if (!ttHit && depth >= 3)
+        depth -= 1;
+    else if (!PVNode && depth >= 8 && ttMove != NO_MOVE && ttDepth + 4 <= depth)
         depth -= 1;
 
-    //Reverse Futility Pruning
-    if (!PVNode && !inCheck && ss->excludedMove == NO_MOVE && depth <= 8 && (!ttMove || ttCapture) && eval > beta + depth * 107 && !rootNode)
+
+    if (!rootNode && !PVNode && !inCheck && ss->excludedMove == NO_MOVE && depth <= 8 && std::abs(eval) < MIN_TB_SCORE)
     {
-        return eval;
+        const int rfpDepth  = std::max(0, depth - improving);
+        const int rfpMargin = 107  * rfpDepth ;
+
+        if (eval - rfpMargin >= beta)
+            return (eval + beta) / 2;
     }
 
     //Razoring
@@ -420,55 +445,62 @@ int Search::alphaBeta(int alpha, int beta, int depth, const bool cutNode, Thread
         if (score >= beta)
             return score < MIN_MATE_SCORE ? score : beta;
     }
-    auto moveList = MoveList(ttMove);
-    legalmoves<ALL_MOVES>(*board, moveList);
+    MovePicker picker(thread, ss, ttMove, PICK_MAIN);
+    uint64_t   beforeNodes = 0;
+    int        lmr;
+    uint16_t   bestMove = NO_MOVE, move = NO_MOVE;
 
-    // checkmate or stalemate
-    if (0 == moveList.numMove)
-    {
-        return inCheck ? -(MAX_MATE_SCORE - ss->ply) : 0;
-    }
-    int      beforeNodes = 0;
-    int      lmr;
-    uint16_t bestMove = NO_MOVE, move = NO_MOVE;
-
-    ss->played = 0;
+    int moveCount = 0;
+    ss->played    = 0;
 
     //loop moves
-    while ((move = moveList.pickMove(thread, ss)) != NO_MOVE)
+    while ((move = picker.next()) != NO_MOVE)
     {
 
         if (move == ss->excludedMove)
             continue;
+
+        moveCount++;
+
         if (rootNode)
             beforeNodes = thread.nodes;
-        ss->move                      = move;
-        ss->playedMoves[ss->played++] = move;
+        ss->move = move;
 
-        if (isQuiet(move) && ss->played > 3 && !PVNode)
+        if (isQuiet(move) && moveCount > 3 && !PVNode)
         {
-            // late move pruning
-            if (depth <= 6 && ss->played > 6 + (2 + 2 * improving) * depth)
+            // late move pruning. Both this and the futility margin below only get
+            // stricter as moveCount grows, so the picker can drop every quiet
+            // move still to come instead of generating and scoring them.
+            if (depth <= 6 && moveCount > 6 + (2 + 2 * improving) * depth)
+            {
+                picker.skipQuiets();
                 continue;
+            }
 
             // futility pruning
-            if (depth <= 10 && eval + std::max(192, -(ss->played) * 10 + 192 + depth * 109) < alpha)
+            if (depth <= 10 && eval + std::max(192, -moveCount * 10 + 192 + depth * 109) < alpha)
+            {
+                picker.skipQuiets();
                 continue;
+            }
 
             //contHist pruning
             int contHist = getContHistory(thread, ss, move);
             if (depth <= 3 && contHist < -3633)
                 continue;
         }
-        if (ss->played > 3 && !PVNode && depth <= 5 && !SEE(*board, move, seeThreshold(isQuiet(move), depth)))
+        if (moveCount > 3 && !PVNode && depth <= 5 && !SEE(*board, move, seeThreshold(isQuiet(move), depth)))
         {
             continue;
         }
+
+        ss->playedMoves[ss->played++] = move;
+
         int history = 0;
         lmr         = 0;
-        if (ss->played > 2 && depth > 2)
+        if (moveCount > 2 && depth > 2)
         {
-            lmr = LMR_TABLE[depth][ss->played];
+            lmr = LMR_TABLE[depth][moveCount];
             lmr -= PVNode;  //reduce less for PV nodes
             lmr += !improving;
 
@@ -520,11 +552,11 @@ int Search::alphaBeta(int alpha, int beta, int depth, const bool cutNode, Thread
                 extension = -1;
 
             //reAssign some stack values that might have been changed
-            ss->played                    = 0;
-            ss->move                      = move;
-            ss->playedMoves[ss->played++] = move;
-            ss->continuationHistory       = &thread.contHist[board->pieceBoard[moveFrom(move)]][moveTo(move)];
-            ss->contCorrHist              = &thread.contCorrHist[board->pieceBoard[moveFrom(move)]][moveTo(move)];
+            ss->played              = 1;
+            ss->move                = move;
+            ss->playedMoves[0]      = move;
+            ss->continuationHistory = &thread.contHist[board->pieceBoard[moveFrom(move)]][moveTo(move)];
+            ss->contCorrHist        = &thread.contCorrHist[board->pieceBoard[moveFrom(move)]][moveTo(move)];
         }
         int newDepth = depth - 1 + extension;
         int d        = newDepth - lmr;
@@ -559,7 +591,7 @@ int Search::alphaBeta(int alpha, int beta, int depth, const bool cutNode, Thread
         if (this->stopped)
             return 0;
 
-        if (rootNode)
+        if (rootNode && thread.ThreadID == 0)
             moveNodes[move] += thread.nodes - beforeNodes;
 
         if (score > bestScore)
@@ -582,6 +614,16 @@ int Search::alphaBeta(int alpha, int beta, int depth, const bool cutNode, Thread
                 break;
             }
         }
+    }
+
+    // checkmate or stalemate: with lazy generation we only know it once the
+    // picker is exhausted. A singular search must return its untouched
+    // bestScore instead, as it did when the excluded move was skipped here.
+    if (moveCount == 0)
+    {
+        if (ss->excludedMove != NO_MOVE)
+            return bestScore;
+        return inCheck ? -(MAX_MATE_SCORE - ss->ply) : 0;
     }
     if (ss->excludedMove == NO_MOVE)
     {
@@ -610,6 +652,14 @@ SearchResult Search::start(Board* board, TimeManager* tm, int ThreadID) {
         stopped  = false;
         seldepth = 0;
         std::fill(moveNodes, moveNodes + (1 << 16), 0);
+
+        // Have a legal move ready before searching anything. m_bestMove is only
+        // written when an iteration completes, so a search that is stopped
+        // before that would otherwise send the best move of the previous
+        // search, which is illegal in this position and loses the game.
+        MoveList rootMoves;
+        legalmoves<ALL_MOVES>(*board, rootMoves);
+        m_bestMove = (rootMoves.numMove > 0) ? rootMoves.moves[0] : NO_MOVE;
 
         for (int i = 0; i < numThread; i++)
         {
@@ -643,18 +693,28 @@ SearchResult Search::start(Board* board, TimeManager* tm, int ThreadID) {
         // aspiration window search
         if (i > 4)
         {
-            int windowSize = 20;
-            int alpha      = score - windowSize;
-            int beta       = score + windowSize;
+            int windowSize  = 20;
+            int alpha       = score - windowSize;
+            int beta        = score + windowSize;
+            int failHighCnt = 0;
             while (true)
             {
-                score = alphaBeta(alpha, beta, i, false, *threads.at(ThreadID), ss + 6);
+                const int adjustedDepth = std::max(1, i - failHighCnt);
+
+                score = alphaBeta(alpha, beta, adjustedDepth, false, *threads.at(ThreadID), ss + 6);
                 if (stopped || (score > alpha && score < beta))
                     break;
                 if (score <= alpha)
-                    alpha = std::max(-VALUE_INFINITE, alpha - windowSize);
+                {
+                    beta        = (alpha + beta) / 2;
+                    alpha       = std::max(-VALUE_INFINITE, alpha - windowSize);
+                    failHighCnt = 0;
+                }
                 else if (score >= beta)
+                {
                     beta = std::min(+VALUE_INFINITE, beta + windowSize);
+                    failHighCnt++;
+                }
 
                 windowSize += windowSize / 3;
             }
@@ -679,7 +739,7 @@ SearchResult Search::start(Board* board, TimeManager* tm, int ThreadID) {
             std::cout << " seldepth " << seldepth;
             if (abs(score) < MIN_MATE_SCORE)
             {
-                std::cout << " score cp " << score / 2;
+                std::cout << " score cp " << 100 * score / NORMALIZE_TO_PAWN;
             }
             else
             {
@@ -696,7 +756,7 @@ SearchResult Search::start(Board* board, TimeManager* tm, int ThreadID) {
                 bmStability = 0;
             previousBestMove = m_bestMove;
 
-            float bestMoveFraction = static_cast<double>(bestMoveNode) / nodes;
+            float bestMoveFraction = static_cast<double>(bestMoveNode) / threads.at(0)->nodes;
             //extra protection
             bestMoveFraction = std::clamp(bestMoveFraction, 0.0f, 1.0f);
             float nodeTm     = (nodeTmBase + bestMoveFraction * nodeTmMultp) / 100.0f;
@@ -720,7 +780,7 @@ SearchResult Search::start(Board* board, TimeManager* tm, int ThreadID) {
         std::cout << "bestmove " << moveToUci(this->m_bestMove, *board) << std::endl;
         runningThreads.clear();
 
-        res.cp    = score / 2;
+        res.cp    = 100 * score / NORMALIZE_TO_PAWN;
         res.move  = this->m_bestMove;
         res.nodes = totalNodes();
         TT::Instance()->updateAge();
