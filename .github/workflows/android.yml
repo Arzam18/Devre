@@ -74,7 +74,7 @@ jobs:
           echo "Compiling with Android NDK Clang++ (Statically linked C++ runtime)..."
           $NDK_CXX -O3 -flto -std=c++17 -pthread \
             -static-libstdc++ \
-            -mssse3 \
+            -D__SSSE3__ \
             -I. -Isrc -D TB_NO_HELPER_API -DNET=\"devre_mc.bin\" \
             $SOURCES -lm -o Devre-android-arm64
 
