@@ -684,6 +684,7 @@ SearchResult Search::start(Board* board, TimeManager* tm, int ThreadID) {
     }
 
     int      score            = 0;
+    int      previousScore    = 0;
     uint16_t previousBestMove = NO_MOVE;
     int      bmStability      = 0;
     for (int i = 1; i <= timeManager->depthLimit; i++)
@@ -767,7 +768,15 @@ SearchResult Search::start(Board* board, TimeManager* tm, int ThreadID) {
             int   rootCorr          = std::abs(adjustEvalWithCorrHist(*threads.at(0), ss + 6, rootRawEval) - rootRawEval);
             float instabilityFactor = 1.0f + std::min(0.25f, rootCorr / 400.0f);
 
-            if (elapsed > timeManager->softTime * nodeTm * stabilityFactor * instabilityFactor)
+            float evalStabilityFactor = 1.0f;
+            if (i > 1 && std::abs(score) < MIN_MATE_SCORE && std::abs(previousScore) < MIN_MATE_SCORE)
+            {
+                int evalDiff = std::abs(score - previousScore);
+                evalStabilityFactor = std::clamp(0.85f + evalDiff / 100.0f, 0.85f, 1.25f);
+            }
+            previousScore = score;
+
+            if (elapsed > timeManager->softTime * nodeTm * stabilityFactor * instabilityFactor * evalStabilityFactor)
                 break;
         }
     }
