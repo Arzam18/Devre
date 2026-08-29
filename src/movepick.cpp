@@ -223,34 +223,41 @@ MovePicker::MovePicker(ThreadData& thread, Stack* ss, uint16_t ttMove, PickMode 
     m_refutations[1] = NO_MOVE;
     m_refutations[2] = NO_MOVE;
 
-    if (mode == PICK_MAIN)
+    //an in check qsearch node searches quiets too, so it wants them ordered
+    if (mode != PICK_QSEARCH)
     {
         m_refutations[0] = ss->killers[0];
         m_refutations[1] = ss->killers[1];
         m_refutations[2] = thread.counterMoves[m_board->sideToMove][moveFrom((ss - 1)->move)][moveTo((ss - 1)->move)];
     }
 
-    m_stage = (mode == PICK_QSEARCH_CHECK) ? STAGE_LEGACY_INIT : STAGE_TT;
+    m_stage = STAGE_TT;
 }
 
 int MovePicker::bestIndex() const
 {
-    if (m_list.numMove <= 0)
+    const int n = m_list.numMove;
+    if (n <= 0)
         return -1;
     int best = 0;
-    for (int i = 1; i < m_list.numMove; i++)
+    int bestScore = m_list.scores[0];
+    const int* scores = m_list.scores;
+    for (int i = 1; i < n; i++)
     {
-        if (m_list.scores[i] > m_list.scores[best])
+        if (scores[i] > bestScore)
+        {
+            bestScore = scores[i];
             best = i;
+        }
     }
     return best;
 }
 
 void MovePicker::removeAt(int index)
 {
-    m_list.moves[index]  = m_list.moves[m_list.numMove - 1];
-    m_list.scores[index] = m_list.scores[m_list.numMove - 1];
-    m_list.numMove--;
+    --m_list.numMove;
+    m_list.moves[index]  = m_list.moves[m_list.numMove];
+    m_list.scores[index] = m_list.scores[m_list.numMove];
 }
 
 void MovePicker::skipQuiets()
@@ -361,7 +368,7 @@ uint16_t MovePicker::next()
     {
     case STAGE_TT :
         m_stage = STAGE_GEN_TACTICAL;
-        if (m_ttMove != NO_MOVE && (m_mode == PICK_MAIN || isQsearchTactical(m_ttMove)) && isPseudoLegal(*m_board, m_ttMove) && isLegal(*m_board, m_ttMove))
+        if (m_ttMove != NO_MOVE && (m_mode != PICK_QSEARCH || isQsearchTactical(m_ttMove)) && isPseudoLegal(*m_board, m_ttMove) && isLegal(*m_board, m_ttMove))
             return m_ttMove;
         [[fallthrough]];
 
@@ -388,7 +395,8 @@ uint16_t MovePicker::next()
             removeAt(index);
             return move;
         }
-        if (m_mode != PICK_MAIN)
+        //out of check qsearch searches tacticals only, in check it needs every evasion
+        if (m_mode == PICK_QSEARCH)
         {
             m_stage = STAGE_DONE;
             return NO_MOVE;
@@ -423,17 +431,6 @@ uint16_t MovePicker::next()
         removeAt(index);
         return move;
     }
-
-    case STAGE_LEGACY_INIT :
-        //in check every evasion is needed, so staging would not save anything
-        m_list.ttMove  = m_ttMove;
-        m_list.qsearch = true;
-        legalmoves<ALL_MOVES>(*m_board, m_list);
-        m_stage = STAGE_LEGACY_PICK;
-        [[fallthrough]];
-
-    case STAGE_LEGACY_PICK :
-        return m_list.pickMove(m_thread, m_ss);
 
     case STAGE_DONE :
     default :

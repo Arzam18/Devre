@@ -20,13 +20,16 @@ namespace {
 
 constexpr int EVAL_SCALE = 400;
 
-// The pairwise stage lands at QA * QA >> INPUT_SHIFT = 127.002, not QA.
+// The pairwise stage lands at QA * QA >> INPUT_SHIFT = 126.008, not QA.
 constexpr float PAIRWISE_QUANT   = static_cast<float>(NNUE::QA) * NNUE::QA / (1 << NNUE::INPUT_SHIFT);
-constexpr float L1_NORMALISATION = 1.0f / (PAIRWISE_QUANT * NNUE::L1_QUANT);
 constexpr int   PAIRWISE_MAX     = (NNUE::QA * NNUE::QA) >> NNUE::INPUT_SHIFT;
-static_assert(PAIRWISE_MAX == 127, "the pairwise activations must fit in int8");
+static_assert(PAIRWISE_MAX == 126, "the pairwise activations must fit in int8");
 
 static_assert(2 * PAIRWISE_MAX * 127 <= 32767, "maddubs would saturate");
+
+// int16 accumulator: the bias plus every one of the 32 psq and 96 pawn-pair rows
+// at the int8 cap, all in one cell.
+static_assert(NNUE::QA + (32 + 96) * 127 <= 32767, "the accumulator would overflow");
 
 // clang-format off
 constexpr uint8_t KING_BUCKET_LAYOUT[64] = {
@@ -68,9 +71,49 @@ static_assert(NNUE_FT_OUT % SIMD::vecSize == 0);
 /// `out` may alias `base` -- the refresh cache updates in place -- so nothing is
 /// `restrict`. Each chunk loads before it stores, so aliasing is safe.
 inline __attribute__((always_inline)) void
-accumulateRows(int16_t* out, const int16_t* base, const int16_t* const* addRows, int nAdd,
-               const int16_t* const* subRows, int nSub) {
+accumulateRows(int16_t* out, const int16_t* base, const int8_t* const* addRows, int nAdd,
+               const int8_t* const* subRows, int nSub) {
     constexpr uint32_t chunkBlocks = (numBlocks < 8) ? numBlocks : 8;
+
+    if (nAdd == 1 && nSub == 1)
+    {
+        const int8_t* add = addRows[0];
+        const int8_t* sub = subRows[0];
+        for (uint32_t chunk = 0; chunk < numBlocks; chunk += chunkBlocks)
+        {
+            const uint32_t offset = chunk * SIMD::vecSize;
+            for (uint32_t b = 0; b < chunkBlocks; b++)
+            {
+                const uint32_t idx = offset + b * SIMD::vecSize;
+                SIMD::vecType acc = SIMD::vecLoad(base + idx);
+                acc = SIMD::vecAddEpi16(acc, SIMD::vecLoadI8ToI16(add + idx));
+                acc = SIMD::vecSubEpi16(acc, SIMD::vecLoadI8ToI16(sub + idx));
+                SIMD::vecStore(out + idx, acc);
+            }
+        }
+        return;
+    }
+
+    if (nAdd == 1 && nSub == 2)
+    {
+        const int8_t* add  = addRows[0];
+        const int8_t* sub0 = subRows[0];
+        const int8_t* sub1 = subRows[1];
+        for (uint32_t chunk = 0; chunk < numBlocks; chunk += chunkBlocks)
+        {
+            const uint32_t offset = chunk * SIMD::vecSize;
+            for (uint32_t b = 0; b < chunkBlocks; b++)
+            {
+                const uint32_t idx = offset + b * SIMD::vecSize;
+                SIMD::vecType acc = SIMD::vecLoad(base + idx);
+                acc = SIMD::vecAddEpi16(acc, SIMD::vecLoadI8ToI16(add + idx));
+                acc = SIMD::vecSubEpi16(acc, SIMD::vecLoadI8ToI16(sub0 + idx));
+                acc = SIMD::vecSubEpi16(acc, SIMD::vecLoadI8ToI16(sub1 + idx));
+                SIMD::vecStore(out + idx, acc);
+            }
+        }
+        return;
+    }
 
     for (uint32_t chunk = 0; chunk < numBlocks; chunk += chunkBlocks)
     {
@@ -82,16 +125,16 @@ accumulateRows(int16_t* out, const int16_t* base, const int16_t* const* addRows,
 
         for (int a = 0; a < nAdd; a++)
         {
-            const int16_t* row = addRows[a] + offset;
+            const int8_t* row = addRows[a] + offset;
             for (uint32_t b = 0; b < chunkBlocks; b++)
-                acc[b] = SIMD::vecAddEpi16(acc[b], SIMD::vecLoad(row + b * SIMD::vecSize));
+                acc[b] = SIMD::vecAddEpi16(acc[b], SIMD::vecLoadI8ToI16(row + b * SIMD::vecSize));
         }
 
         for (int s = 0; s < nSub; s++)
         {
-            const int16_t* row = subRows[s] + offset;
+            const int8_t* row = subRows[s] + offset;
             for (uint32_t b = 0; b < chunkBlocks; b++)
-                acc[b] = SIMD::vecSubEpi16(acc[b], SIMD::vecLoad(row + b * SIMD::vecSize));
+                acc[b] = SIMD::vecSubEpi16(acc[b], SIMD::vecLoadI8ToI16(row + b * SIMD::vecSize));
         }
 
         for (uint32_t b = 0; b < chunkBlocks; b++)
@@ -111,7 +154,7 @@ inline float screlu(float x) {
 // 48-byte header (magic, format version, nine architecture fields) then the
 // tensors back to back in NetworkData's declaration order. `VERSION` is already
 // the engine's own version macro, hence the prefix.
-constexpr char     MAGIC[8]    = {'D', 'V', 'N', 'N', 'U', 'E', '3', '\0'};
+constexpr char     MAGIC[8]    = {'D', 'V', 'N', 'N', 'U', 'E', '4', '\0'};
 constexpr uint32_t NET_VERSION = 1;
 constexpr size_t   HEADER_LEN  = 48;
 
@@ -168,8 +211,8 @@ void NNUE::refresh(const Board& board, Color perspective, int16_t* accumulator) 
     const PerspectiveKey key = perspectiveKey(bitScanForward(board.bitboards[pieceIndex(perspective, KING)]),
                                               perspective);
 
-    const int16_t* rows[32 + 96];
-    int            nRows = 0;
+    const int8_t* rows[32 + 96];
+    int           nRows = 0;
 
     // Entry i of both buffers must be the same pawn: pawnPairIndex
     // canonicalises each perspective independently.
@@ -213,8 +256,8 @@ void NNUE::applyPly(Board& board, Color perspective, int idx, PerspectiveKey key
     const auto&        prev = board.nnueData.accumulator[idx - 1];
 
     // 4 psq + 2 moved pawns x 15 partners + 1 = 35.
-    const int16_t* addRows[48];
-    const int16_t* subRows[48];
+    const int8_t* addRows[48];
+    const int8_t* subRows[48];
     int            nAdd = 0;
     int            nSub = 0;
 
@@ -238,7 +281,7 @@ void NNUE::applyPly(Board& board, Color perspective, int idx, PerspectiveKey key
 }
 
 void NNUE::pawnPairDelta(const uint64_t prevPawns[N_COLORS], const uint64_t curPawns[N_COLORS], Color perspective,
-                         PerspectiveKey key, const int16_t** addRows, int& nAdd, const int16_t** subRows,
+                         PerspectiveKey key, const int8_t** addRows, int& nAdd, const int8_t** subRows,
                          int& nSub) const {
     if (prevPawns[WHITE] == curPawns[WHITE] && prevPawns[BLACK] == curPawns[BLACK])
         return;
@@ -273,7 +316,7 @@ void NNUE::pawnPairDelta(const uint64_t prevPawns[N_COLORS], const uint64_t curP
     const uint64_t keptWhite = prevPawns[WHITE] & curPawns[WHITE];
     const uint64_t keptBlack = prevPawns[BLACK] & curPawns[BLACK];
 
-    auto pairsWithKept = [&](const int* moved, int count, const int16_t** rows, int& n) {
+    auto pairsWithKept = [&](const int* moved, int count, const int8_t** rows, int& n) {
         for (int i = 0; i < count; i++)
         {
             const int id   = moved[i] & 0xFF;
@@ -309,7 +352,7 @@ void NNUE::pawnPairDelta(const uint64_t prevPawns[N_COLORS], const uint64_t curP
 void NNUE::refreshFromCache(Board& board, Color perspective, PerspectiveKey key, int16_t* accumulator) const {
     const NetworkData& net   = *network;
     auto&              entry = board.nnueData.refreshCache[(perspective * KING_BUCKETS + key.bucket) * 2
-                                              + (key.flip & 7 ? 1 : 0)];
+                                               + (key.flip & 7 ? 1 : 0)];
 
     if (!entry.initialised)
     {
@@ -319,8 +362,8 @@ void NNUE::refreshFromCache(Board& board, Color perspective, PerspectiveKey key,
     }
 
     // 32 psq + at most 96 pawn pairs; no delta exceeds a full rebuild.
-    const int16_t* addRows[32 + 96];
-    const int16_t* subRows[32 + 96];
+    const int8_t* addRows[32 + 96];
+    const int8_t* subRows[32 + 96];
     int            nAdd = 0;
     int            nSub = 0;
 
@@ -344,8 +387,8 @@ void NNUE::refreshFromCache(Board& board, Color perspective, PerspectiveKey key,
     const uint64_t currentPawns[N_COLORS] = {board.bitboards[WHITE_PAWN], board.bitboards[BLACK_PAWN]};
     pawnPairDelta(cachedPawns, currentPawns, perspective, key, addRows, nAdd, subRows, nSub);
 
-
-    accumulateRows(entry.data, entry.data, addRows, nAdd, subRows, nSub);
+    if (nAdd != 0 || nSub != 0)
+        accumulateRows(entry.data, entry.data, addRows, nAdd, subRows, nSub);
     std::memcpy(entry.pieces, board.bitboards, sizeof(entry.pieces));
     std::memcpy(accumulator, entry.data, NNUE_FT_OUT * sizeof(int16_t));
 }
@@ -394,7 +437,8 @@ int NNUE::finishHead(const int32_t* l1Dots, int bucket) const {
     float l1Activations[2 * L1_SIZE];
     for (int i = 0; i < L1_SIZE; i++)
     {
-        const float value = static_cast<float>(l1Dots[i]) * L1_NORMALISATION + net.l1Biases[bucket * L1_SIZE + i];
+        const int   out   = bucket * L1_SIZE + i;
+        const float value = static_cast<float>(l1Dots[i]) * net.l1Norm[out] + net.l1Biases[out];
         l1Activations[i]           = crelu(value);
         l1Activations[L1_SIZE + i] = screlu(value);
     }
@@ -418,7 +462,6 @@ int NNUE::finishHead(const int32_t* l1Dots, int bucket) const {
     // Skip connection: the output layer sees the L1 activations as well.
     std::memcpy(head + L2_SIZE, l1Activations, sizeof(l1Activations));
 
-    
     constexpr int LANES = 8;
     static_assert(HEAD_SIZE % LANES == 0);
 
@@ -439,8 +482,9 @@ int NNUE::finishHead(const int32_t* l1Dots, int bucket) const {
 /// product of two [0, 255] values fits a 16-bit lane, so a logical shift is the
 /// whole `>> INPUT_SHIFT` and nothing widens to int32.
 void NNUE::computePairwise(const int16_t* stm, const int16_t* nstm, uint8_t* out) {
-    const SIMD::vecType zero = SIMD::vecZero();
-    const SIMD::vecType clip = SIMD::vecSet1Epi16(static_cast<int16_t>(QA));
+    const SIMD::vecType zero      = SIMD::vecZero();
+    const SIMD::vecType clip      = SIMD::vecSet1Epi16(static_cast<int16_t>(QA));
+    const SIMD::vecType roundBias = SIMD::vecSet1Epi16(1 << (INPUT_SHIFT - 1));
 
     for (int perspective = 0; perspective < 2; perspective++)
     {
@@ -456,7 +500,8 @@ void NNUE::computePairwise(const int16_t* stm, const int16_t* nstm, uint8_t* out
                 const SIMD::vecType lo = SIMD::vecMinEpi16(clip, SIMD::vecMaxEpi16(zero, SIMD::vecLoad(acc + at)));
                 const SIMD::vecType hi =
                     SIMD::vecMinEpi16(clip, SIMD::vecMaxEpi16(zero, SIMD::vecLoad(acc + at + PW)));
-                products[half] = SIMD::vecSrliEpi16<INPUT_SHIFT>(SIMD::vecMulloEpi16(lo, hi));
+                products[half] =
+                    SIMD::vecSrliEpi16<INPUT_SHIFT>(SIMD::vecAddEpi16(SIMD::vecMulloEpi16(lo, hi), roundBias));
             }
             SIMD::vecStoreRaw(dest + i, SIMD::packUnsignedEpi16(products[0], products[1]));
         }
@@ -572,7 +617,7 @@ bool NNUE::loadFromBuffer(const uint8_t* data, size_t size, const std::string& s
         return fail("shorter than the header");
 
     if (std::memcmp(data, MAGIC, sizeof(MAGIC)) != 0)
-        return fail("bad magic (expected DVNNUE3)");
+        return fail("bad magic (expected DVNNUE4)");
 
     auto expect = [&](const char* field, uint64_t got, uint64_t want, bool& ok) {
         if (got != want)
@@ -599,7 +644,8 @@ bool NNUE::loadFromBuffer(const uint8_t* data, size_t size, const std::string& s
     // Not sizeof(NetworkData): the struct is padded to its alignment, the file
     // is not.
     constexpr size_t payload = sizeof(NetworkData::ftWeights) + sizeof(NetworkData::ftBiases)
-                             + sizeof(NetworkData::l1Weights) + sizeof(NetworkData::l1Biases)
+                             + sizeof(NetworkData::l1Weights) + sizeof(NetworkData::l1Norm)
+                             + sizeof(NetworkData::l1Biases)
                              + sizeof(NetworkData::l2Weights) + sizeof(NetworkData::l2Biases)
                              + sizeof(NetworkData::l3Weights) + sizeof(NetworkData::l3Biases);
 
@@ -620,6 +666,7 @@ bool NNUE::loadFromBuffer(const uint8_t* data, size_t size, const std::string& s
     read(net.ftWeights, sizeof(net.ftWeights));
     read(net.ftBiases, sizeof(net.ftBiases));
     read(net.l1Weights, sizeof(net.l1Weights));
+    read(net.l1Norm, sizeof(net.l1Norm));
     read(net.l1Biases, sizeof(net.l1Biases));
     read(net.l2Weights, sizeof(net.l2Weights));
     read(net.l2Biases, sizeof(net.l2Biases));
