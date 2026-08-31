@@ -84,7 +84,7 @@ jobs:
       - name: Verify macro defines under our build flags
         run: |
           NDK_CXX="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++"
-          echo | $NDK_CXX -x C++ -O3 -std=c++17 -D__SSSE3__ -E -dM - | grep -E "__AVX2__|__SSSE3__|__AVX512"
+          echo | $NDK_CXX -xc++ -O3 -std=c++17 -D__SSSE3__ -E -dM - | grep -E "__AVX2__|__SSSE3__|__AVX512"
 
       - name: Verify Android Binary
         run: |
