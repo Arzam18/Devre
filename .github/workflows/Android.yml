@@ -41,11 +41,9 @@ jobs:
 
               original = content
 
-              # Replace immintrin header with sse2neon
               if "<immintrin.h>" in content:
                   content = content.replace("<immintrin.h>", "\"sse2neon.h\"")
 
-              # Fallback for std::aligned_alloc on Android NDK
               if "std::aligned_alloc" in content:
                   content = content.replace(
                       "ptr = std::aligned_alloc(Alignment, std::max(alignedBytes, Alignment));",
@@ -72,8 +70,6 @@ jobs:
       - name: Build Devre for Android ARM64 (Statically Linked)
         run: |
           NDK_CXX="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++"
-          
-          # Include all .cpp files and ONLY tbprobe.c
           SOURCES=$(find . -type f \( -name "*.cpp" -o -name "tbprobe.c" \) ! -path "*/devre_pgo/*")
 
           echo "Compiling with Android NDK Clang++ (Statically linked C++ runtime)..."
@@ -115,6 +111,45 @@ jobs:
           NDK_CXX="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++"
           $NDK_CXX -O2 -std=c++17 -D__SSSE3__ -I. /tmp/test_simd.cpp -o /tmp/test_simd -static
           qemu-aarch64 /tmp/test_simd
+
+      - name: Test vecMaddubsEpi16 and reduction correctness
+        run: |
+          cat > /tmp/test_simd2.cpp << 'EOF'
+          #include "sse2neon.h"
+          #include <cstdint>
+          #include <cstdio>
+
+          int main() {
+              uint8_t u8vals[16];
+              int8_t i8vals[16];
+              for (int i = 0; i < 16; i++) {
+                  u8vals[i] = static_cast<uint8_t>(i);
+                  i8vals[i] = (i % 2 == 0) ? 1 : -1;
+              }
+              __m128i u8 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(u8vals));
+              __m128i i8 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(i8vals));
+
+              __m128i madd = _mm_maddubs_epi16(u8, i8);
+              int16_t maddOut[8];
+              _mm_storeu_si128(reinterpret_cast<__m128i*>(maddOut), madd);
+              printf("maddubs result: ");
+              for (int i = 0; i < 8; i++) printf("%d ", maddOut[i]);
+              printf("\n");
+              printf("Expected (pairs: u8[2i]*1 + u8[2i+1]*-1): -1 -1 -1 -1 -1 -1 -1 -1\n");
+
+              __m128i sum = _mm_setzero_si128();
+              sum = _mm_add_epi32(sum, _mm_madd_epi16(madd, _mm_set1_epi16(1)));
+              sum = _mm_add_epi32(sum, _mm_shuffle_epi32(sum, 0x4E));
+              sum = _mm_add_epi32(sum, _mm_shuffle_epi32(sum, 0xB1));
+              int result = _mm_cvtsi128_si32(sum);
+              printf("Reduced sum: %d (expected: -8)\n", result);
+
+              return 0;
+          }
+          EOF
+          NDK_CXX="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++"
+          $NDK_CXX -O2 -std=c++17 -D__SSSE3__ -I. /tmp/test_simd2.cpp -o /tmp/test_simd2 -static
+          qemu-aarch64 /tmp/test_simd2
 
       - name: Verify Android Binary
         run: |
