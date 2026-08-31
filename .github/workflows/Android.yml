@@ -1,0 +1,98 @@
+name: Build Devre for Android
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "*" ]
+  pull_request:
+    branches: [ "*" ]
+
+permissions:
+  contents: write
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Download sse2neon Header
+        run: |
+          curl -sL https://raw.githubusercontent.com/DLTcollab/sse2neon/master/sse2neon.h -o sse2neon.h
+
+      - name: Patch SIMD Headers and aligned_alloc
+        run: |
+          python3 -c '
+          import os
+
+          def patch_file(path):
+              with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                  content = f.read()
+
+              original = content
+
+              # Replace immintrin header with sse2neon
+              if "<immintrin.h>" in content:
+                  content = content.replace("<immintrin.h>", "\"sse2neon.h\"")
+
+              # Fallback for std::aligned_alloc on Android NDK
+              if "std::aligned_alloc" in content:
+                  content = content.replace(
+                      "ptr = std::aligned_alloc(Alignment, std::max(alignedBytes, Alignment));",
+                      "posix_memalign(&ptr, Alignment, std::max(alignedBytes, Alignment));"
+                  )
+
+              if content != original:
+                  with open(path, "w", encoding="utf-8") as f:
+                      f.write(content)
+                  print(f"Patched: {path}")
+
+          for root, dirs, files in os.walk("."):
+              for file in files:
+                  if file.endswith((".h", ".hpp", ".cpp", ".c")):
+                      patch_file(os.path.join(root, file))
+          '
+
+      - name: Download Evaluation Network
+        run: |
+          if [ ! -f "devre_mc.bin" ]; then
+            curl -sL "https://github.com/OmerFarukTutkun/DevreNets/raw/main/devre_mc.bin" -o devre_mc.bin
+          fi
+
+      - name: Build Devre for Android ARM64 (Statically Linked)
+        run: |
+          NDK_CXX="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++"
+          
+          # Include all .cpp files and ONLY tbprobe.c
+          SOURCES=$(find . -type f \( -name "*.cpp" -o -name "tbprobe.c" \) ! -path "*/devre_pgo/*")
+
+          echo "Compiling with Android NDK Clang++ (Statically linked C++ runtime)..."
+          $NDK_CXX -O3 -flto -std=c++17 -pthread \
+            -static-libstdc++ \
+            -D__SSSE3__ \
+            -I. -Isrc -D TB_NO_HELPER_API -DNET=\"devre_mc.bin\" \
+            $SOURCES -lm -o Devre-android-arm64
+
+          mkdir -p dist/bin
+          mv Devre-android-arm64 dist/bin/
+
+      - name: Verify macro defines under our build flags
+        run: |
+          NDK_CXX="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++"
+          echo | $NDK_CXX -O3 -std=c++17 -D__SSSE3__ -E -dM - | grep -E "__AVX2__|__SSSE3__|__AVX512"
+
+      - name: Verify Android Binary
+        run: |
+          ls -lh dist/bin/
+          file dist/bin/*
+
+      - name: Upload Android Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: devre-android-arm64
+          path: dist/bin/*
