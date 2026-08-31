@@ -21,6 +21,11 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
+      - name: Install qemu-user
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user
+
       - name: Download sse2neon Header
         run: |
           curl -sL https://raw.githubusercontent.com/DLTcollab/sse2neon/master/sse2neon.h -o sse2neon.h
@@ -84,7 +89,32 @@ jobs:
       - name: Verify macro defines under our build flags
         run: |
           NDK_CXX="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++"
-          echo | $NDK_CXX -xc++ -O3 -std=c++17 -D__SSSE3__ -E -dM - | grep -E "__AVX2__|__SSSE3__|__AVX512"
+          echo | $NDK_CXX -xc++ -O3 -flto -std=c++17 -pthread -static-libstdc++ -D__SSSE3__ -E -dM - | grep -E "__AVX2__|__SSSE3__|__AVX512|__ARM_NEON"
+
+      - name: Test vecLoadI8ToI16 correctness under sse2neon
+        run: |
+          cat > /tmp/test_simd.cpp << 'EOF'
+          #include "sse2neon.h"
+          #include <cstdint>
+          #include <cstdio>
+
+          int main() {
+              int8_t input[8] = {-1, 2, -3, 4, -5, 6, -7, 8};
+              __m128i bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(input));
+              __m128i sign = _mm_cmpgt_epi8(_mm_setzero_si128(), bytes);
+              __m128i result = _mm_unpacklo_epi8(bytes, sign);
+              int16_t out[8];
+              _mm_storeu_si128(reinterpret_cast<__m128i*>(out), result);
+              printf("Expected: -1 2 -3 4 -5 6 -7 8\n");
+              printf("Got:      ");
+              for (int i = 0; i < 8; i++) printf("%d ", out[i]);
+              printf("\n");
+              return 0;
+          }
+          EOF
+          NDK_CXX="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++"
+          $NDK_CXX -O2 -std=c++17 -D__SSSE3__ -I. /tmp/test_simd.cpp -o /tmp/test_simd -static
+          qemu-aarch64 /tmp/test_simd
 
       - name: Verify Android Binary
         run: |
