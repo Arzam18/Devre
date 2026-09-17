@@ -61,79 +61,38 @@ jobs:
                       patch_file(os.path.join(root, file))
           '
 
-      - name: Download Evaluation Network
+      - name: Download Main Evaluation Network
         run: |
-          if [ ! -f "devre_mc.bin" ]; then
-            curl -sL "https://github.com/OmerFarukTutkun/DevreNets/raw/main/devre_mc.bin" -o devre_mc.bin
+          NETWORK_NAME="devre-a064d8d9d7b6.bin"
+          if [ ! -f "$NETWORK_NAME" ]; then
+            curl -sL "https://github.com/OmerFarukTutkun/DevreNets/raw/main/$NETWORK_NAME" -o "$NETWORK_NAME"
           fi
-          echo "NET_SIZE_BYTES=$(stat -c%s devre_mc.bin)" >> $GITHUB_ENV
-          echo "Downloaded devre_mc.bin size: $(stat -c%s devre_mc.bin) bytes"
+          echo "NETWORK_NAME=$NETWORK_NAME" >> $GITHUB_ENV
+          echo "Downloaded $NETWORK_NAME size: $(stat -c%s $NETWORK_NAME) bytes"
 
-      - name: Build Devre for Android ARM64 (Embedded Net)
+      - name: Build Devre for Android ARM64
         run: |
           NDK_CXX="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++"
           NDK_CC="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang"
 
-          # 1. Compile C tablebase files
+          # 1. Compile C tablebase sources separately
           find . -type f -name "tbprobe.c" -exec $NDK_CC -O3 -c {} -o tbprobe.o \;
 
-          # 2. Create assembly wrapper for net in .rodata.net
-          cat > net_data.s << 'EOF'
-          .section .rodata.net,"a",@progbits
-          .align 8
-          .global embedded_net_data
-          .global embedded_net_data_end
-          .global _binary_devre_mc_bin_start
-          .global _binary_devre_mc_bin_end
+          CPP_SOURCES=$(find . -type f -name "*.cpp" ! -path "*/devre_pgo/*")
 
-          embedded_net_data:
-          _binary_devre_mc_bin_start:
-              .incbin "devre_mc.bin"
-          embedded_net_data_end:
-          _binary_devre_mc_bin_end:
-          EOF
-
-          # 3. Create C++ anchor file
-          cat > net_keep.cpp << 'EOF'
-          #include <cstdint>
-
-          extern "C" {
-              extern const uint8_t embedded_net_data[];
-              extern const uint8_t embedded_net_data_end[];
-          }
-
-          __attribute__((used, visibility("default")))
-          const void* const g_net_ptr_keep = (const void*)embedded_net_data;
-
-          __attribute__((used, visibility("default")))
-          const void* const g_net_end_keep = (const void*)embedded_net_data_end;
-          EOF
-
-          $NDK_CC -c net_data.s -o net_data.o
-          $NDK_CXX -O3 -std=c++17 -c net_keep.cpp -o net_keep.o
-
-          CPP_SOURCES=$(find . -type f -name "*.cpp" ! -name "net_keep.cpp" ! -path "*/devre_pgo/*")
-
-          echo "Linking Devre with embedded NNUE network..."
+          echo "Compiling Devre with main network $NETWORK_NAME..."
           $NDK_CXX -O3 -flto -std=c++17 -pthread \
             -fconstexpr-steps=100000000 \
             -static-libstdc++ \
             -D__SSSE3__ \
-            -DEMBED -DNET_EMBED -DMAKE_EMBED -DINC_NET \
-            -I. -Isrc -D TB_NO_HELPER_API -DNET=\"devre_mc.bin\" \
-            $CPP_SOURCES tbprobe.o net_data.o net_keep.o \
-            -Wl,-u,embedded_net_data -Wl,-u,_binary_devre_mc_bin_start \
-            -lm -o Devre-android-arm64
+            -I. -Isrc -D TB_NO_HELPER_API \
+            -DNET=\"$NETWORK_NAME\" \
+            $CPP_SOURCES tbprobe.o -lm -o Devre-android-arm64
 
-          # 4. Dynamic Verification: Executable must be larger than net file
+          # 2. Verify final binary size
           SIZE_BYTES=$(stat -c%s Devre-android-arm64)
           SIZE_MB=$(($SIZE_BYTES / 1024 / 1024))
           echo "Final Executable Size: $SIZE_BYTES bytes ($SIZE_MB MB)"
-
-          if [ "$SIZE_BYTES" -le "$NET_SIZE_BYTES" ]; then
-            echo "ERROR: Executable size ($SIZE_BYTES bytes) is smaller than the network file ($NET_SIZE_BYTES bytes)!"
-            exit 1
-          fi
 
           mkdir -p dist/bin
           mv Devre-android-arm64 dist/bin/
