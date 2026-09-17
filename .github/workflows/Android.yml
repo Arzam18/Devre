@@ -76,9 +76,9 @@ jobs:
           # 1. Compile C tablebase files
           find . -type f -name "tbprobe.c" -exec $NDK_CC -O3 -c {} -o tbprobe.o \;
 
-          # 2. Create assembly wrapper with GNU SHF_GNU_RETAIN ('R') flag
+          # 2. Create assembly wrapper in dedicated .rodata.net section
           cat > net_data.s << 'EOF'
-          .section .rodata,"aR",@progbits
+          .section .rodata.net,"a",@progbits
           .align 8
           .global embedded_net_data
           .global embedded_net_data_end
@@ -92,10 +92,9 @@ jobs:
           _binary_devre_mc_bin_end:
           EOF
 
-          # 3. Create C++ reference file to prevent LTO symbol stripping
+          # 3. Create C++ reference file to anchor symbols into LTO AST
           cat > net_keep.cpp << 'EOF'
           #include <cstdint>
-          #include <cstddef>
 
           extern "C" {
               extern const uint8_t embedded_net_data[];
@@ -123,7 +122,7 @@ jobs:
             -DEMBED -DNET_EMBED -DMAKE_EMBED -DINC_NET \
             -I. -Isrc -D TB_NO_HELPER_API -DNET=\"devre_mc.bin\" \
             $CPP_SOURCES tbprobe.o net_data.o net_keep.o \
-            -Wl,--no-gc-sections \
+            -Wl,-u,embedded_net_data -Wl,-u,_binary_devre_mc_bin_start \
             -lm -o Devre-android-arm64
 
           # 4. Verify binary size
