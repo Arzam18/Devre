@@ -68,82 +68,73 @@ jobs:
           fi
           echo "Downloaded devre_mc.bin size: $(stat -c%s devre_mc.bin) bytes"
 
-      - name: Inspect Devre Source Embedding References
-        run: |
-          python3 -c '
-          import os
-
-          print("=== DEVRE SOURCE EMBEDDING DIAGNOSTICS ===")
-          for root, dirs, files in os.walk("."):
-              for file in files:
-                  if file.endswith((".cpp", ".h", ".hpp")):
-                      path = os.path.join(root, file)
-                      with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                          content = f.read()
-                      lines = content.splitlines()
-                      for idx, line in enumerate(lines):
-                          if any(k in line for k in ["EMBED", "incbin", "gNetData", "devre_mc", "fopen"]):
-                              print(f"{path}:{idx+1}: {line.strip()}")
-          '
-
-      - name: Build Devre for Android ARM64 (Statically Linked & Embedded Net)
+      - name: Build Devre for Android ARM64 (Guaranteed Network Embedding)
         run: |
           NDK_CXX="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++"
           NDK_CC="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang"
 
-          # 1. Compile C tablebase sources separately
+          # 1. Compile C tablebase files
           find . -type f -name "tbprobe.c" -exec $NDK_CC -O3 -c {} -o tbprobe.o \;
 
-          # 2. Create assembly wrapper exporting all standard symbol variants for the network
-          cat > net_wrapper.s << 'EOF'
-          .section .rodata,"a",@progbits
+          # 2. Create assembly wrapper with GNU SHF_GNU_RETAIN ('R') flag
+          cat > net_data.s << 'EOF'
+          .section .rodata,"aR",@progbits
           .align 8
+          .global embedded_net_data
+          .global embedded_net_data_end
           .global _binary_devre_mc_bin_start
           .global _binary_devre_mc_bin_end
-          .global _binary_devre_mc_bin_size
-          .global _binary_net_bin_start
-          .global _binary_net_bin_end
-          .global gNetDataStart
-          .global gNetDataEnd
-          .global incbin_net_start
-          .global incbin_net_end
 
+          embedded_net_data:
           _binary_devre_mc_bin_start:
-          _binary_net_bin_start:
-          gNetDataStart:
-          incbin_net_start:
-          .incbin "devre_mc.bin"
-
+              .incbin "devre_mc.bin"
+          embedded_net_data_end:
           _binary_devre_mc_bin_end:
-          _binary_net_bin_end:
-          gNetDataEnd:
-          incbin_net_end:
-
-          _binary_devre_mc_bin_size:
-          .quad _binary_devre_mc_bin_end - _binary_devre_mc_bin_start
           EOF
 
-          # Assemble network wrapper directly for ARM64
-          $NDK_CC -c net_wrapper.s -o net.o
+          # 3. Create C++ reference file to prevent LTO symbol stripping
+          cat > net_keep.cpp << 'EOF'
+          #include <cstdint>
+          #include <cstddef>
 
-          CPP_SOURCES=$(find . -type f -name "*.cpp" ! -path "*/devre_pgo/*")
+          extern "C" {
+              extern const uint8_t embedded_net_data[];
+              extern const uint8_t embedded_net_data_end[];
+          }
 
-          echo "Compiling Devre with forced network section embedding..."
+          __attribute__((used, visibility("default")))
+          const void* const g_net_ptr_keep = (const void*)embedded_net_data;
+
+          __attribute__((used, visibility("default")))
+          const void* const g_net_end_keep = (const void*)embedded_net_data_end;
+          EOF
+
+          # Compile assembly and bridge objects
+          $NDK_CC -c net_data.s -o net_data.o
+          $NDK_CXX -O3 -std=c++17 -c net_keep.cpp -o net_keep.o
+
+          CPP_SOURCES=$(find . -type f -name "*.cpp" ! -name "net_keep.cpp" ! -path "*/devre_pgo/*")
+
+          echo "Linking Devre with embedded NNUE network..."
           $NDK_CXX -O3 -flto -std=c++17 -pthread \
             -fconstexpr-steps=100000000 \
             -static-libstdc++ \
             -D__SSSE3__ \
             -DEMBED -DNET_EMBED -DMAKE_EMBED -DINC_NET \
             -I. -Isrc -D TB_NO_HELPER_API -DNET=\"devre_mc.bin\" \
-            $CPP_SOURCES tbprobe.o \
-            -Wl,--whole-archive net.o -Wl,--no-whole-archive \
+            $CPP_SOURCES tbprobe.o net_data.o net_keep.o \
+            -Wl,--no-gc-sections \
             -lm -o Devre-android-arm64
 
-          # 3. Verify final binary size
+          # 4. Verify binary size
           SIZE_BYTES=$(stat -c%s Devre-android-arm64)
-          NET_BYTES=$(stat -c%s devre_mc.bin)
-          echo "Engine Binary Size: $SIZE_BYTES bytes ($(($SIZE_BYTES / 1024 / 1024)) MB)"
-          echo "Network File Size:  $NET_BYTES bytes ($(($NET_BYTES / 1024 / 1024)) MB)"
+          SIZE_MB=$(($SIZE_BYTES / 1024 / 1024))
+          echo "Final Executable Size: $SIZE_MB MB ($SIZE_BYTES bytes)"
+
+          if [ "$SIZE_BYTES" -lt 15000000 ]; then
+            echo "ERROR: Executable size ($SIZE_MB MB) is below expected embedded threshold!"
+            exit 1
+          fi
 
           mkdir -p dist/bin
           mv Devre-android-arm64 dist/bin/
