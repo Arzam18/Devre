@@ -66,9 +66,10 @@ jobs:
           if [ ! -f "devre_mc.bin" ]; then
             curl -sL "https://github.com/OmerFarukTutkun/DevreNets/raw/main/devre_mc.bin" -o devre_mc.bin
           fi
+          echo "NET_SIZE_BYTES=$(stat -c%s devre_mc.bin)" >> $GITHUB_ENV
           echo "Downloaded devre_mc.bin size: $(stat -c%s devre_mc.bin) bytes"
 
-      - name: Build Devre for Android ARM64 (Guaranteed Network Embedding)
+      - name: Build Devre for Android ARM64 (Embedded Net)
         run: |
           NDK_CXX="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++"
           NDK_CC="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang"
@@ -76,7 +77,7 @@ jobs:
           # 1. Compile C tablebase files
           find . -type f -name "tbprobe.c" -exec $NDK_CC -O3 -c {} -o tbprobe.o \;
 
-          # 2. Create assembly wrapper in dedicated .rodata.net section
+          # 2. Create assembly wrapper for net in .rodata.net
           cat > net_data.s << 'EOF'
           .section .rodata.net,"a",@progbits
           .align 8
@@ -92,7 +93,7 @@ jobs:
           _binary_devre_mc_bin_end:
           EOF
 
-          # 3. Create C++ reference file to anchor symbols into LTO AST
+          # 3. Create C++ anchor file
           cat > net_keep.cpp << 'EOF'
           #include <cstdint>
 
@@ -108,7 +109,6 @@ jobs:
           const void* const g_net_end_keep = (const void*)embedded_net_data_end;
           EOF
 
-          # Compile assembly and bridge objects
           $NDK_CC -c net_data.s -o net_data.o
           $NDK_CXX -O3 -std=c++17 -c net_keep.cpp -o net_keep.o
 
@@ -125,13 +125,13 @@ jobs:
             -Wl,-u,embedded_net_data -Wl,-u,_binary_devre_mc_bin_start \
             -lm -o Devre-android-arm64
 
-          # 4. Verify binary size
+          # 4. Dynamic Verification: Executable must be larger than net file
           SIZE_BYTES=$(stat -c%s Devre-android-arm64)
           SIZE_MB=$(($SIZE_BYTES / 1024 / 1024))
-          echo "Final Executable Size: $SIZE_MB MB ($SIZE_BYTES bytes)"
+          echo "Final Executable Size: $SIZE_BYTES bytes ($SIZE_MB MB)"
 
-          if [ "$SIZE_BYTES" -lt 15000000 ]; then
-            echo "ERROR: Executable size ($SIZE_MB MB) is below expected embedded threshold!"
+          if [ "$SIZE_BYTES" -le "$NET_SIZE_BYTES" ]; then
+            echo "ERROR: Executable size ($SIZE_BYTES bytes) is smaller than the network file ($NET_SIZE_BYTES bytes)!"
             exit 1
           fi
 
