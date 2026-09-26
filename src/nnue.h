@@ -12,7 +12,7 @@
 class NNUE {
    public:
     // Input space: two disjoint blocks feeding one shared accumulator.
-    static constexpr int KING_BUCKETS     = 12;
+    static constexpr int KING_BUCKETS     = NNUE_KING_BUCKETS;
     static constexpr int PSQ_FEATURES     = 768 * KING_BUCKETS;              // 9216
     static constexpr int PAWN_IDS         = 96;                              // 48 friendly + 48 enemy
     static constexpr int PAWN_PAIRS       = PAWN_IDS * (PAWN_IDS - 1) / 2;   // 4560
@@ -20,13 +20,12 @@ class NNUE {
     static constexpr int NUM_TAC_FEATURES = PAWN_PAIRS + NUM_THREATS;        // 64368
     static constexpr int FT_IN            = PSQ_FEATURES + NUM_TAC_FEATURES; // 73584
 
-    // Head: FT -> pairwise -> L1 -> L2 -> scalar.
-    static constexpr int PW             = NNUE_FT_OUT / 2;         // 384 pairwise outputs
-    static constexpr int L1_SIZE        = 16;
+    static constexpr int PW             = NNUE_FT_OUT / 2;         // 512 pairwise outputs
+    static constexpr int L1_SIZE        = 32;
     static constexpr int L2_SIZE        = 32;
-    static constexpr int HEAD_SIZE      = L2_SIZE + 2 * L1_SIZE;   // 64, [L2 act | L1 act]
+    static constexpr int HEAD_SIZE      = L2_SIZE + 2 * L1_SIZE;   // 96, [L2 act | L1 act]
     // The L1 input is consumed as 4-byte groups, the unit one dpbusd lane eats.
-    static constexpr int L1_GROUPS      = 2 * PW / 4;              // 192
+    static constexpr int L1_GROUPS      = 2 * PW / 4;              // 256
     static constexpr int OUTPUT_BUCKETS = 1;
     static constexpr int EVAL_SCALE     = 427;
     static constexpr int QA          = 127;  // FT / accumulator scale (int8 weights)
@@ -50,7 +49,7 @@ class NNUE {
         alignas(64) int8_t  l1Weights[L1_GROUPS][4 * L1_SIZE];
         alignas(64) float   l1Norm[L1_SIZE];
         alignas(64) float   l1Biases[L1_SIZE];
-        alignas(64) float   l2Weights[L2_SIZE][2 * L1_SIZE];
+        alignas(64) float   l2Weights[2 * L1_SIZE][L2_SIZE];
         alignas(64) float   l2Biases[L2_SIZE];
         alignas(64) float   l3Weights[HEAD_SIZE];
         alignas(64) float   l3Biases;
@@ -71,24 +70,20 @@ class NNUE {
 
     static PerspectiveKey perspectiveKey(int kingSquare, Color perspective);
 
-    void refresh(const Board& board, Color perspective, PerspectiveKey key, int16_t* psqOut,
-                 int16_t* tacOut) const;
-    void refreshPsq(const Board& board, Color perspective, PerspectiveKey key, int16_t* out) const;
-    void refreshTac(const Board& board, Color perspective, PerspectiveKey key, int16_t* out) const;
+    FinnyEntry& syncFinny(NNUEData& data, const uint64_t* pieces, Color perspective, PerspectiveKey key) const;
+    void        refresh(Board& board, Color perspective, PerspectiveKey key, int16_t* out) const;
 
     void updatePerspective(Board& board, Color perspective) const;
-    void applyPly(Board& board, Color perspective, int idx, PerspectiveKey key, bool doPsq, bool doTac) const;
+    void applyPly(Board& board, Color perspective, int idx) const;
 
     void pawnPairDelta(const uint64_t prevPawns[N_COLORS], const uint64_t curPawns[N_COLORS], Color perspective,
                        PerspectiveKey key, const int8_t** addRows, int& nAdd, const int8_t** subRows,
                        int& nSub) const;
 
-    static void computePairwise(const int16_t* stmPsq, const int16_t* stmTac, const int16_t* ntmPsq,
-                                const int16_t* ntmTac, uint8_t* out);
+    static void computePairwise(const int16_t* stm, const int16_t* ntm, uint8_t* out);
     void        l1Dots(const uint8_t* pairwise, int32_t* dots) const;
     int         finishHead(const int32_t* dots) const;
-    int         runHead(const int16_t* stmPsq, const int16_t* stmTac, const int16_t* ntmPsq,
-                        const int16_t* ntmTac) const;
+    int         runHead(const int16_t* stm, const int16_t* ntm) const;
 
     bool loadFromBuffer(const uint8_t* data, size_t size, const std::string& sourceLabel);
 
@@ -101,9 +96,7 @@ class NNUE {
     static float materialScale(Board& board);
     static float halfMoveScale(Board& board);
 
-    // Called from makeMove, the last point where the node's board state exists,
-    // so the whole subtree below can delta from here instead of each leaf
-    // rebuilding from the bias.
+    // Called from makeMove, the last point where this ply's board exists.
     void refreshOnBucketChange(Board& board, Color moved) const;
 
     void calculateInputLayer(Board& board, int idx, bool fromScratch = false);
